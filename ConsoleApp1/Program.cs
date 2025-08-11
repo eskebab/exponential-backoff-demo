@@ -43,9 +43,16 @@ while (true)
             DequeueCount = 0 // Initial dequeue count
         };
 
+        // Use the same JSON options
+        var jsonOptions = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            WriteIndented = false
+        };
+
         // Send the message
         Console.WriteLine($"Sending: {message}");
-        await queueClient.SendMessageAsync(JsonSerializer.Serialize(messageDto));
+        await queueClient.SendMessageAsync(JsonSerializer.Serialize(messageDto, jsonOptions));
         Console.WriteLine($"-> Sent: '{message}'");
     }
 }
