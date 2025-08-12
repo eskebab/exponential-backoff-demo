@@ -1,5 +1,5 @@
 ﻿using Azure.Storage.Queues;
-using ConsoleApp1;
+using ProducerApp;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 using System.Text.Json;
@@ -12,10 +12,8 @@ public class ExpBackoffDemo
     private readonly Random _random = new();
     private readonly QueueClient _queueClient;
     private readonly QueueClient _poisonQueueClient;
+    private readonly int _maxDequeueCount = 12; // Maximum number of times a message can be dequeued
     const string connectionString = "UseDevelopmentStorage=true";
-    const string queueName = "myqueue-items";
-    const string poisonQueueName = "myqueue-items-poison";
-    const int maxDequeueCount = 12; // Maximum number of times a message can be dequeued
 
     private static readonly JsonSerializerOptions _jsonOptions = new JsonSerializerOptions
     {
@@ -23,9 +21,15 @@ public class ExpBackoffDemo
         WriteIndented = false
     };
 
-    public ExpBackoffDemo(ILogger<ExpBackoffDemo> logger)
+    // Modify constructor to accept queue names for testing
+    public ExpBackoffDemo(
+        ILogger<ExpBackoffDemo> logger,
+        string queueName = "myqueue-items",
+        string poisonQueueName = "myqueue-items-poison",
+        int maxRetryCount = 12)
     {
         _logger = logger;
+        _maxDequeueCount = maxRetryCount;
 
         // Initialize the queue client with explicit Base64 encoding
         QueueClientOptions options = new()
@@ -40,12 +44,17 @@ public class ExpBackoffDemo
     public async Task Run([QueueTrigger("myqueue-items", Connection = "AzureWebJobsStorage")] string message)
     {
         // Declare messageDto outside the try block so it's accessible in the catch block
-        MessageDto? messageDto = null;
+        MessageBodyWrapper? messageDto = null;
 
         try
         {
-            messageDto = JsonSerializer.Deserialize<MessageDto>(message, _jsonOptions);
+            messageDto = JsonSerializer.Deserialize<MessageBodyWrapper>(message, _jsonOptions);
             _logger.LogInformation("Dequeue Count: {dequeueCount}", messageDto?.DequeueCount);
+
+            if (messageDto == null)
+            {
+                throw new JsonException("Failed to deserialize message to MessageDto");
+            }
 
             ProcessMessageWithRandomFailures(messageDto);
         }
@@ -53,7 +62,7 @@ public class ExpBackoffDemo
         {
             if (messageDto != null)
             {
-                await RequeueWithBackoff(messageDto);
+                await RequeueWithBackoff(messageDto, ex);
             }
             else
             {
@@ -61,7 +70,6 @@ public class ExpBackoffDemo
                 _logger.LogError("Failed to deserialize message: {message}", message);
                 _logger.LogError(ex, "Error processing queue message");
             }
-
         }
     }
 
@@ -71,7 +79,7 @@ public class ExpBackoffDemo
         _logger.LogInformation("⚡️ CONSUMER TRIGGERED! Received message: '{message}'", queueMessage);
     }
 
-    private void ProcessMessageWithRandomFailures(MessageDto messageDto)
+    private void ProcessMessageWithRandomFailures(MessageBodyWrapper messageDto)
     {
         // Generate a random number between 0-9
         int randomValue = _random.Next(10);
@@ -87,25 +95,34 @@ public class ExpBackoffDemo
         _logger.LogInformation("🎲 Random success (0/10 chance)");
     }
 
-    private async Task RequeueWithBackoff(MessageDto message)
+    private async Task RequeueWithBackoff(MessageBodyWrapper message, Exception exception)
     {
+        // Don't retry on certain exceptions
+        if (exception is JsonException || exception is ArgumentException)
+        {
+            _logger.LogWarning("Permanent error detected - sending to poison queue immediately");
+            await SendToPoisonQueue(message);
+            return;
+        }
+
+        // For transient errors, apply backoff strategy
         var newMessage = message with
         {
             DequeueCount = message.DequeueCount + 1 // Increment the dequeue count
         };
 
-        // Serialize the metadata and original message
-        string newMessageSerialized = JsonSerializer.Serialize(newMessage, _jsonOptions);
-
-        if (newMessage.DequeueCount > maxDequeueCount)
+        if (newMessage.DequeueCount > _maxDequeueCount)
         {
             // If the message has been dequeued too many times, send it to the poison queue
             _logger.LogWarning("Message '{message}' has exceeded maximum dequeue count. Sending to poison queue.", newMessage.Message);
-            await _poisonQueueClient.SendMessageAsync(newMessageSerialized, TimeSpan.FromSeconds(0), TimeSpan.FromDays(7));
+            await SendToPoisonQueue(newMessage);
             return;
         }
         else
         {
+            // Serialize the metadata and original message
+            string newMessageSerialized = JsonSerializer.Serialize(newMessage, _jsonOptions);
+
             // Add the message back to the queue with visibility timeout
             await _queueClient.SendMessageAsync(newMessageSerialized,
                 GetVisibilityTimeout(newMessage.DequeueCount), // Visibility timeout (delay before processing)
@@ -113,22 +130,29 @@ public class ExpBackoffDemo
         }
     }
 
-    private static TimeSpan GetVisibilityTimeout(int deQueueCount)
+    private async Task SendToPoisonQueue(MessageBodyWrapper message)
+    {
+        // Serialize the message for the poison queue
+        string messageSerialized = JsonSerializer.Serialize(message, _jsonOptions);
+        await _poisonQueueClient.SendMessageAsync(messageSerialized, TimeSpan.FromSeconds(0), TimeSpan.FromDays(7));
+    }
+
+    public virtual TimeSpan GetVisibilityTimeout(int deQueueCount)
     {
         var visibilityTimeout = deQueueCount switch
         {
-            1 => TimeSpan.FromSeconds(1),
-            2 => TimeSpan.FromSeconds(2),
-            3 => TimeSpan.FromSeconds(3),
-            4 => TimeSpan.FromSeconds(4),
-            5 => TimeSpan.FromSeconds(5),
-            6 => TimeSpan.FromSeconds(6),
-            7 => TimeSpan.FromSeconds(7),
-            8 => TimeSpan.FromSeconds(8),
-            9 => TimeSpan.FromSeconds(9),
-            10 => TimeSpan.FromSeconds(10),
-            11 => TimeSpan.FromSeconds(11),
-            _ => TimeSpan.FromSeconds(12),
+            1 => TimeSpan.FromSeconds(10),
+            2 => TimeSpan.FromSeconds(30),
+            3 => TimeSpan.FromMinutes(1),
+            4 => TimeSpan.FromMinutes(5),
+            5 => TimeSpan.FromMinutes(10),
+            6 => TimeSpan.FromMinutes(30),
+            7 => TimeSpan.FromHours(1),
+            8 => TimeSpan.FromHours(3),
+            9 => TimeSpan.FromHours(6),
+            10 => TimeSpan.FromHours(12),
+            11 => TimeSpan.FromHours(12),
+            _ => TimeSpan.FromHours(12),
         };
 
         return visibilityTimeout;

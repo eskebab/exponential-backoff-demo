@@ -1,8 +1,6 @@
 ﻿using Azure.Storage.Queues;
-using ConsoleApp1;
-using System;
+using ProducerApp;
 using System.Text.Json;
-using System.Threading.Tasks;
 
 Console.WriteLine("⚙️ Console Producer App started.");
 Console.WriteLine("---------------------------------");
@@ -37,7 +35,7 @@ while (true)
         messageCount++;
         string message = $"Message #{messageCount} from the console app at {DateTime.Now:O}";
 
-        var messageDto = new MessageDto
+        var messageDto = new MessageBodyWrapper
         {
             Message = message,
             DequeueCount = 0 // Initial dequeue count
